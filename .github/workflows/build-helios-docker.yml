@@ -56,6 +56,16 @@ jobs:
           cat vayu_docker.config >> arch/arm64/configs/$DEFCONFIG
           echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
 
+      - name: Patch kbuild for GNU Make 4.3
+        run: |
+          make --version | head -1
+          if grep -q 'include-dir=$(CURDIR)' Makefile; then
+            echo "kbuild fix already present"
+          else
+            sed -i 's|^# o Look for make include files relative to root of kernel src$|&\nMAKEFLAGS += -rR --include-dir=$(CURDIR)|' Makefile
+            grep -n 'include-dir' Makefile || { echo "::error::kbuild patch failed to apply"; exit 1; }
+          fi
+
       - name: Build
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
