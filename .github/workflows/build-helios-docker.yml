@@ -1,0 +1,100 @@
+name: Build Helios vayu (Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU flavour'
+        required: true
+        default: 'classic'
+        type: choice
+        options: [classic, next]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: docker
+      KBUILD_BUILD_HOST: gh-ci
+      DEFCONFIG: vayu_user_defconfig
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            python3 zip unzip wget curl kmod cpio device-tree-compiler \
+            ccache zstd gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Fetch Neutron Clang
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang" && cd "$GITHUB_WORKSPACE/clang"
+          curl -LSs "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman
+          chmod +x antman
+          ./antman -S
+          ./antman --patch=glibc
+          ./bin/clang --version | head -2
+
+      - name: Inject KernelSU
+        run: |
+          if [ "${{ inputs.ksu_variant }}" = "next" ]; then
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          else
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          fi
+          test -d KernelSU || test -d drivers/kernelsu || { echo "::error::KernelSU not injected"; exit 1; }
+
+      - name: Append Docker configs
+        run: |
+          cat vayu_docker.config >> arch/arm64/configs/$DEFCONFIG
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
+
+      - name: Build
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          MAKE_ARGS="O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make O=out ARCH=arm64 $DEFCONFIG
+          make -j$(nproc) $MAKE_ARGS Image 2>&1 | tee build.log
+          make -j$(nproc) $MAKE_ARGS dtbo.img 2>&1 | tee -a build.log || echo "dtbo.img not produced (non-fatal)"
+
+      - name: Verify required configs landed
+        run: |
+          fail=0
+          for c in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE \
+                   CONFIG_USER_NS CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS \
+                   CONFIG_BRIDGE_NETFILTER CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
+                   CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_KSU; do
+            if grep -q "^${c}=y" out/.config; then echo "OK      $c"
+            else echo "MISSING $c"; fail=1; fi
+          done
+          [ $fail -eq 0 ] || { echo "::error::required configs missing from built kernel"; exit 1; }
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -f ak3/anykernel.sh
+          cp anykernel.sh ak3/anykernel.sh
+          cp out/arch/arm64/boot/Image ak3/
+          cp out/arch/arm64/boot/dtbo.img ak3/ 2>/dev/null || true
+          cd ak3 && zip -r9 "../Helios-vayu-Docker-$(date +%Y%m%d).zip" * -x '.git*'
+          ls -lh ../Helios-vayu-Docker-*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Helios-vayu-Docker
+          path: Helios-vayu-Docker-*.zip
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
